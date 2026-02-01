@@ -11,9 +11,15 @@ load_dotenv()
 # --- HTTP Helpers ---
 
 def request_with_retry(url, headers, payload, max_retries=5):
-    """Make HTTP POST with retry on rate limit (429) and server errors (5xx)."""
+    """Make HTTP POST with retry on rate limit (429), server errors (5xx), and network failures."""
     for attempt in range(max_retries):
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
+        except requests.exceptions.RequestException as e:
+            wait_time = 2 ** attempt
+            print(f"Network error: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+            continue
 
         if response.status_code == 429 or response.status_code >= 500:
             wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
@@ -425,7 +431,7 @@ class RunCommand:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=30,
                 cwd=os.getcwd()
             )
 
