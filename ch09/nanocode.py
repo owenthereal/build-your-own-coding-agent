@@ -379,7 +379,7 @@ class SearchCodebase:
                             for i, line in enumerate(f):
                                 if query.lower() in line.lower():
                                     results.append(f"{file_path}:{i+1}: {line.strip()}")
-                    except:
+                    except Exception:
                         continue
 
             return "\n".join(results) if results else "No matches found."
@@ -569,8 +569,6 @@ class Agent:
         try:
             self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
             self.brain_name = new_name
-            if new_name == "deepseek":
-                return f"Switched to: {new_name} (chat only, tools disabled)"
             return f"Switched to: {new_name}"
         except ValueError as e:
             return f"Cannot switch to {new_name}: {e}"
