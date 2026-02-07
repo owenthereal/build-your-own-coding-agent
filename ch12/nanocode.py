@@ -431,7 +431,7 @@ class SearchCodebase:
                             for i, line in enumerate(f):
                                 if query.lower() in line.lower():
                                     results.append(f"{file_path}:{i+1}: {line.strip()}")
-                    except:
+                    except Exception:
                         continue
 
             return "\n".join(results) if results else "No matches found."

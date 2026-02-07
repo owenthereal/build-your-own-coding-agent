@@ -284,8 +284,6 @@ class Agent:
         try:
             self.brain = BRAINS[new_name](tools=tool_definitions(self.tools))
             self.brain_name = new_name
-            if new_name == "deepseek":
-                return f"Switched to: {new_name} (chat only, tools disabled)"
             return f"Switched to: {new_name}"
         except ValueError as e:
             return f"Cannot switch to {new_name}: {e}"
