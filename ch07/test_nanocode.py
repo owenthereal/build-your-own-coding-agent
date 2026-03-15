@@ -3,7 +3,8 @@ import tempfile
 import pytest
 from nanocode import (
     Agent, AgentStop, Thought, ToolCall, ToolContext, Memory,
-    ReadFile, WriteFile, SaveMemory, get_tool, tool_definitions, tools,
+    ReadFile, WriteFile, WritePlan, SaveMemory, get_tool, tool_definitions,
+    tools,
 )
 
 
@@ -98,39 +99,75 @@ def test_mode_command_defaults_to_plan():
     assert agent.mode == "plan"
 
 
-# --- Write file with mode tests (using tool directly) ---
+# --- Tool filtering by mode ---
 
-def test_write_file_blocked_in_plan_mode():
-    """Verify WriteFile is blocked for non-PLAN.md files in plan mode."""
-    tool = WriteFile()
-    context = ToolContext(mode="plan")
-    result = tool.execute(context, path="test.py", content="hello")
+def test_plan_mode_hides_write_file():
+    """Verify plan mode does not expose write_file to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool_names = [t["name"] for t in agent.brain.tools]
 
-    assert "BLOCKED" in result
-    assert "plan mode" in result
+    assert "write_file" not in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
 
 
-def test_write_file_allowed_to_plan_md_in_plan_mode():
-    """Verify WriteFile allows PLAN.md even in plan mode."""
+def test_act_mode_shows_all_tools():
+    """Verify act mode exposes all tools to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+
+def test_mode_switch_updates_brain_tools():
+    """Verify switching mode changes the brain's tool menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+
+    # Plan mode: no write_file
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+
+    # Switch to act: write_file appears
+    agent.handle_input("/mode act")
+    act_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" in act_names
+
+    # Switch back to plan: write_file disappears
+    agent.handle_input("/mode plan")
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+
+
+# --- WritePlan tool ---
+
+def test_write_plan_saves_file():
+    """Verify WritePlan writes to PLAN.md."""
+    original_dir = os.getcwd()
     with tempfile.TemporaryDirectory() as tmpdir:
-        plan_path = os.path.join(tmpdir, "PLAN.md")
-        tool = WriteFile()
-        context = ToolContext(mode="plan")
+        os.chdir(tmpdir)
+        try:
+            tool = WritePlan()
+            context = ToolContext()
+            result = tool.execute(context, content="# My Plan\n\nStep 1: Read code")
 
-        result = tool.execute(context, plan_path, "# My Plan")
+            assert "Plan saved" in result
+            assert os.path.exists("PLAN.md")
+            with open("PLAN.md") as f:
+                assert f.read() == "# My Plan\n\nStep 1: Read code"
+        finally:
+            os.chdir(original_dir)
 
-        assert "Plan saved" in result
-        assert os.path.exists(plan_path)
-        with open(plan_path) as f:
-            assert f.read() == "# My Plan"
 
+# --- WriteFile tool (no mode checks, always works) ---
 
-def test_write_file_allowed_in_act_mode():
-    """Verify WriteFile works for any file in act mode."""
+def test_write_file_writes_file():
+    """Verify WriteFile writes content to the given path."""
     with tempfile.TemporaryDirectory() as tmpdir:
         file_path = os.path.join(tmpdir, "test.py")
         tool = WriteFile()
-        context = ToolContext(mode="act")
+        context = ToolContext()
 
         result = tool.execute(context, file_path, "print('hello')")
 
@@ -138,67 +175,13 @@ def test_write_file_allowed_in_act_mode():
         assert os.path.exists(file_path)
 
 
-# --- Write file with mode tests (through agent) ---
-
-def test_agent_write_file_blocked_in_plan_mode():
-    """Verify write_file is blocked for non-PLAN.md files in plan mode."""
-    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
-    result = agent._execute_tool("write_file", {"path": "test.py", "content": "hello"})
-
-    assert "BLOCKED" in result
-    assert "plan mode" in result
-
-
-def test_agent_write_file_allowed_to_plan_md_in_plan_mode():
-    """Verify write_file allows PLAN.md even in plan mode."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        plan_path = os.path.join(tmpdir, "PLAN.md")
-        agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
-
-        result = agent._execute_tool("write_file", {"path": plan_path, "content": "# My Plan"})
-
-        assert "Plan saved" in result
-        assert os.path.exists(plan_path)
-        with open(plan_path) as f:
-            assert f.read() == "# My Plan"
-
-
-def test_agent_write_file_allowed_in_act_mode():
-    """Verify write_file works for any file in act mode."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        file_path = os.path.join(tmpdir, "test.py")
-        agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
-
-        result = agent._execute_tool("write_file", {"path": file_path, "content": "print('hello')"})
-
-        assert "Successfully wrote" in result
-        assert os.path.exists(file_path)
-
-
-def test_mode_switch_affects_write_file():
-    """Verify changing mode affects write_file behavior."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        file_path = os.path.join(tmpdir, "test.py")
-        agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
-
-        # Should be blocked in plan mode
-        result1 = agent._execute_tool("write_file", {"path": file_path, "content": "v1"})
-        assert "BLOCKED" in result1
-
-        # Switch to act mode
-        agent.handle_input("/mode act")
-
-        # Should work in act mode
-        result2 = agent._execute_tool("write_file", {"path": file_path, "content": "v2"})
-        assert "Successfully wrote" in result2
-
-
 # --- Agent has all tools ---
 
 def test_agent_has_all_tools():
-    """Verify agent has all tools including write_file and save_memory."""
+    """Verify agent has all tools for execution."""
     agent = Agent(brain=FakeBrain(), tools=tools)
     tool_names = [t.name for t in agent.tools]
     assert "read_file" in tool_names
     assert "write_file" in tool_names
+    assert "write_plan" in tool_names
     assert "save_memory" in tool_names

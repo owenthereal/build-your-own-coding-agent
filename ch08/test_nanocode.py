@@ -3,7 +3,7 @@ import tempfile
 import pytest
 from nanocode import (
     Agent, AgentStop, Thought, ToolCall, ToolContext, Memory,
-    ReadFile, WriteFile, ListFiles, SearchCodebase, SaveMemory,
+    ReadFile, WriteFile, WritePlan, ListFiles, SearchCodebase, SaveMemory,
     get_tool, tool_definitions, tools,
 )
 
@@ -65,12 +65,77 @@ def test_mode_command_switches_to_act():
     assert agent.mode == "act"
 
 
-def test_write_file_blocked_in_plan_mode():
-    """Verify WriteFile is blocked in plan mode."""
-    tool = WriteFile()
-    context = ToolContext(mode="plan")
-    result = tool.execute(context, path="test.py", content="hello")
-    assert "BLOCKED" in result
+# --- Tool filtering by mode ---
+
+def test_plan_mode_hides_write_file():
+    """Verify plan mode does not expose write_file to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" not in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+
+def test_act_mode_shows_all_tools():
+    """Verify act mode exposes all tools to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+
+def test_mode_switch_updates_brain_tools():
+    """Verify switching mode changes the brain's tool menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+
+    agent.handle_input("/mode act")
+    act_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" in act_names
+
+    agent.handle_input("/mode plan")
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+
+
+# --- WritePlan tool ---
+
+def test_write_plan_saves_file():
+    """Verify WritePlan writes to PLAN.md."""
+    original_dir = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.chdir(tmpdir)
+        try:
+            tool = WritePlan()
+            context = ToolContext()
+            result = tool.execute(context, content="# My Plan\n\nStep 1: Read code")
+
+            assert "Plan saved" in result
+            assert os.path.exists("PLAN.md")
+            with open("PLAN.md") as f:
+                assert f.read() == "# My Plan\n\nStep 1: Read code"
+        finally:
+            os.chdir(original_dir)
+
+
+# --- WriteFile tool (no mode checks, always works) ---
+
+def test_write_file_writes_file():
+    """Verify WriteFile writes content to the given path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = os.path.join(tmpdir, "test.py")
+        tool = WriteFile()
+        context = ToolContext()
+
+        result = tool.execute(context, file_path, "print('hello')")
+
+        assert "Successfully wrote" in result
+        assert os.path.exists(file_path)
 
 
 # --- New tests for Chapter 8: Awareness tools ---

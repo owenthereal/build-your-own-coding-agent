@@ -23,7 +23,10 @@ def request_with_retry(url, headers, payload, max_retries=10):
 
         if response.status_code == 429 or response.status_code >= 500:
             retry_after = response.headers.get("retry-after")
-            wait_time = int(retry_after) if retry_after else 2 ** attempt
+            try:
+                wait_time = int(retry_after) if retry_after else 2 ** attempt
+            except (ValueError, TypeError):
+                wait_time = 2 ** attempt
             print(f"Error {response.status_code}. Retrying in {wait_time}s...")
             time.sleep(wait_time)
             continue
@@ -61,10 +64,11 @@ class ToolCall:
 class Thought:
     """Standardized response from any Brain."""
 
-    def __init__(self, text=None, tool_calls=None, raw_content=None):
+    def __init__(self, text=None, tool_calls=None, raw_content=None, thinking=None):
         self.text = text  # str or None
         self.tool_calls = tool_calls or []  # list of ToolCall
         self.raw_content = raw_content  # original API response for message history
+        self.thinking = thinking  # str or None
 
 
 # --- Memory Class ---
@@ -102,8 +106,7 @@ class Memory:
 class ToolContext:
     """What tools need to know about the agent's state."""
 
-    def __init__(self, mode=None, memory=None):
-        self.mode = mode      # "plan" or "act"
+    def __init__(self, memory=None):
         self.memory = memory  # Memory object or None
 
 
@@ -117,6 +120,31 @@ class Brain:
     def think(self, conversation):
         """Process conversation, return Thought."""
         raise NotImplementedError
+
+    def _parse_response(self, content):
+        """Convert API response format to Thought."""
+        text_parts = []
+        tool_calls = []
+        thinking = None
+
+        for block in content:
+            if block["type"] == "thinking":
+                thinking = block["thinking"]
+            elif block["type"] == "text":
+                text_parts.append(block["text"])
+            elif block["type"] == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block["id"],
+                    name=block["name"],
+                    args=block["input"]
+                ))
+
+        return Thought(
+            text="\n".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            raw_content=content,
+            thinking=thinking
+        )
 
 
 class Claude(Brain):
@@ -139,7 +167,11 @@ class Claude(Brain):
         }
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 10000
+            },
             "messages": conversation
         }
         if self.memory:
@@ -147,32 +179,10 @@ class Claude(Brain):
         if self.tools:
             payload["tools"] = self.tools
 
-        print("(Claude is thinking...)")
         response = request_with_retry(self.url, headers, payload)
         data = response.json()
         self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
         return self._parse_response(data["content"])
-
-    def _parse_response(self, content):
-        """Convert Claude's response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            raw_content=content
-        )
 
 
 class DeepSeek(Brain):
@@ -204,32 +214,10 @@ class DeepSeek(Brain):
         if self.tools:
             payload["tools"] = self.tools
 
-        print("(DeepSeek is thinking...)")
         response = request_with_retry(self.url, headers, payload)
         data = response.json()
         self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
         return self._parse_response(data["content"])
-
-    def _parse_response(self, content):
-        """Convert Anthropic response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            raw_content=content
-        )
 
 
 # Available brains
@@ -244,11 +232,12 @@ BRAINS = {
 class ReadFile:
     """Reads a file from the filesystem."""
     name = "read_file"
+    plan_safe = True
     description = "Reads a file from the filesystem. Use this to examine code."
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "The relative path to the file"}
+            "path": {"type": "string", "description": "The path to the file"}
         },
         "required": ["path"]
     }
@@ -265,34 +254,20 @@ class ReadFile:
 
 
 class WriteFile:
-    """Writes content to a file (mode-aware)."""
+    """Writes content to a file."""
     name = "write_file"
-    description = "Writes content to a file. In plan mode, only PLAN.md is allowed."
+    plan_safe = False
+    description = "Writes content to a file."
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "The relative path to the file"},
+            "path": {"type": "string", "description": "The path to the file"},
             "content": {"type": "string", "description": "The full content to write"}
         },
         "required": ["path", "content"]
     }
 
     def execute(self, context, path, content):
-        # Always allow writing to PLAN.md
-        if os.path.basename(path) == "PLAN.md":
-            print(f"  → Writing {path}")
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                return "Plan saved successfully to PLAN.md"
-            except Exception as e:
-                return f"Error saving plan: {e}"
-
-        # Block in plan mode
-        if context.mode == "plan":
-            return f"BLOCKED: Cannot write to '{path}' in plan mode. Write to 'PLAN.md' instead."
-
-        # Allow in act mode
         print(f"  → Writing {path}")
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -302,9 +277,33 @@ class WriteFile:
             return f"Error writing file: {e}"
 
 
+class WritePlan:
+    """Saves a plan to PLAN.md."""
+    name = "write_plan"
+    plan_safe = True
+    description = "Saves a plan to PLAN.md. Use this to outline your approach before making changes."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The plan content in markdown"}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print("  → Writing PLAN.md")
+        try:
+            with open("PLAN.md", 'w', encoding='utf-8') as f:
+                f.write(content)
+            return "Plan saved to PLAN.md"
+        except Exception as e:
+            return f"Error saving plan: {e}"
+
+
 class EditFile:
     """Replaces text in a file (surgical edit)."""
     name = "edit_file"
+    plan_safe = False
     description = "Replaces specific text in a file. Use for surgical edits instead of rewriting entire files."
     input_schema = {
         "type": "object",
@@ -318,9 +317,6 @@ class EditFile:
 
     def execute(self, context, path, old_text, new_text):
         print(f"  → Editing {path}")
-        if context.mode == "plan":
-            return "BLOCKED: Cannot edit files in plan mode."
-
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -337,6 +333,7 @@ class EditFile:
 class ListFiles:
     """Lists files in the project structure."""
     name = "list_files"
+    plan_safe = True
     description = "Lists all files in the project structure. Useful to understand the project layout."
     input_schema = {
         "type": "object",
@@ -350,8 +347,7 @@ class ListFiles:
         try:
             file_list = []
             for root, dirs, files in os.walk(path):
-                if any(p in root for p in [".git", "__pycache__", "venv", ".nanocode"]):
-                    continue
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
 
                 level = root.replace(path, '').count(os.sep)
                 indent = ' ' * 4 * (level)
@@ -368,6 +364,7 @@ class ListFiles:
 class SearchCodebase:
     """Searches for a string in all files."""
     name = "search_codebase"
+    plan_safe = True
     description = "Searches the entire codebase for a text string. Useful to find where functions or variables are defined."
     input_schema = {
         "type": "object",
@@ -383,8 +380,7 @@ class SearchCodebase:
         results = []
         try:
             for root, dirs, files in os.walk(path):
-                if any(p in root for p in [".git", "__pycache__", "venv", ".nanocode"]):
-                    continue
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
 
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -404,6 +400,7 @@ class SearchCodebase:
 class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
+    plan_safe = True
     description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
     input_schema = {
         "type": "object",
@@ -422,9 +419,10 @@ class SaveMemory:
 
 
 class RunCommand:
-    """Executes shell commands (mode-aware)."""
+    """Executes shell commands."""
     name = "run_command"
-    description = "Executes a terminal command. Use this to run scripts, tests, or install packages. Blocked in plan mode."
+    plan_safe = False
+    description = "Executes a terminal command. Use this to run scripts, tests, or install packages."
     input_schema = {
         "type": "object",
         "properties": {
@@ -435,10 +433,6 @@ class RunCommand:
 
     def execute(self, context, command):
         print(f"  → Running: {command[:50]}...")
-        # Block in plan mode - running commands can modify state
-        if context.mode == "plan":
-            return "BLOCKED: Cannot run commands in plan mode. Switch to act mode first."
-
         try:
             result = subprocess.run(
                 command,
@@ -482,7 +476,7 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WriteFile(), EditFile(), ListFiles(), SearchCodebase(), SaveMemory(), RunCommand()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), EditFile(), RunCommand()]
 
 
 # --- Agent Class ---
@@ -497,6 +491,13 @@ class Agent:
         self.mode = mode  # "plan" or "act"
         self.brain_name = brain_name
         self.conversation = []
+        self.brain.tools = self._tools_for_mode()
+
+    def _tools_for_mode(self):
+        """Return tool definitions based on current mode."""
+        if self.mode == "act":
+            return tool_definitions(self.tools)
+        return tool_definitions([t for t in self.tools if t.plan_safe])
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
@@ -526,10 +527,12 @@ class Agent:
         parts = user_input.strip().split()
         if len(parts) > 1 and parts[1] == "act":
             self.mode = "act"
+            self.brain.tools = self._tools_for_mode()
             return "⚠️  Switched to ACT MODE (Writing Enabled)"
         else:
             self.mode = "plan"
-            return "🛡️  Switched to PLAN MODE (Read-Only)"
+            self.brain.tools = self._tools_for_mode()
+            return "🛡️  Switched to PLAN MODE (Code Read-Only)"
 
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
@@ -538,6 +541,13 @@ class Agent:
 
         for _iteration in range(max_iterations):
             thought = self.brain.think(self.conversation)
+
+            # Display thinking
+            if thought.thinking:
+                lines = thought.thinking.strip().split("\n")[:5]
+                for i, line in enumerate(lines):
+                    prefix = "  💭 " if i == 0 else "     "
+                    print(f"\033[2m{prefix}{line}\033[0m")
 
             # Compact if approaching context limit
             if self.brain.last_input_tokens > self.brain.context_limit * 0.75:
@@ -583,7 +593,12 @@ class Agent:
                        f"Focus on what was accomplished, what's in progress, "
                        f"and key decisions:\n\n{history}"
         }]
-        thought = self.brain.think(prompt)
+        saved_tools = self.brain.tools
+        self.brain.tools = []
+        try:
+            thought = self.brain.think(prompt)
+        finally:
+            self.brain.tools = saved_tools
         self.conversation = [
             {"role": "user", "content": f"Previous conversation summary: {thought.text}"},
         ]
@@ -594,7 +609,7 @@ class Agent:
         if tool is None:
             return f"Error: Tool '{name}' not found"
         try:
-            context = ToolContext(mode=self.mode, memory=self.memory)
+            context = ToolContext(memory=self.memory)
             return tool.execute(context, **args)
         except TypeError as e:
             return f"Error: Invalid arguments - {e}"
@@ -606,7 +621,7 @@ class Agent:
         new_name = names[(idx + 1) % len(names)]
 
         try:
-            self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
+            self.brain = BRAINS[new_name](memory=self.memory, tools=self._tools_for_mode())
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
@@ -630,7 +645,7 @@ def main():
     if mode == "act":
         print("Mode: ACT (Writing Enabled)")
     else:
-        print("Mode: PLAN (Read-Only)")
+        print("Mode: PLAN (Code Read-Only)")
 
     while True:
         try:

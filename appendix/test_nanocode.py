@@ -1,6 +1,91 @@
 """Tests for Nanocode Streaming (Appendix A)."""
 
-from nanocode import parse_sse_events, build_thought_from_events, Thought, ToolCall
+import json
+from nanocode import Thought, ToolCall
+
+
+# --- Test Helpers ---
+
+def parse_sse_events(raw_lines):
+    """Parse raw SSE lines into a list of event dicts."""
+    events = []
+    for line in raw_lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        if not line.startswith("data: "):
+            continue
+        try:
+            events.append(json.loads(line[6:]))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return events
+
+
+def build_thought_from_events(events, print_fn=None, thinking_print_fn=None):
+    """Build a Thought from parsed SSE events. Returns (Thought, input_tokens)."""
+    text_parts = []
+    thinking_parts = []
+    raw_content = []
+    tool_calls = []
+    current_tool = None
+    input_tokens = 0
+
+    for data in events:
+        event_type = data.get("type")
+
+        if event_type == "message_start":
+            input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+
+        elif event_type == "error":
+            error = data.get("error", {})
+            raise Exception(f"Stream error: {error.get('message', data)}")
+
+        elif event_type == "content_block_start":
+            block = data.get("content_block", {})
+            if block.get("type") == "tool_use":
+                current_tool = {"id": block["id"], "name": block["name"], "input": ""}
+
+        elif event_type == "content_block_delta":
+            delta = data.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                text = delta["thinking"]
+                if thinking_print_fn:
+                    thinking_print_fn(text)
+                thinking_parts.append(text)
+            elif delta.get("type") == "text_delta":
+                text = delta["text"]
+                if print_fn:
+                    print_fn(text)
+                text_parts.append(text)
+            elif delta.get("type") == "input_json_delta":
+                if current_tool:
+                    current_tool["input"] += delta.get("partial_json", "")
+
+        elif event_type == "content_block_stop":
+            if current_tool:
+                tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
+                tool_calls.append(ToolCall(
+                    id=current_tool["id"],
+                    name=current_tool["name"],
+                    args=tool_input
+                ))
+                current_tool = None
+
+    full_text = "".join(text_parts)
+    full_thinking = "".join(thinking_parts)
+    if full_thinking:
+        raw_content.append({"type": "thinking", "thinking": full_thinking})
+    if full_text:
+        raw_content.append({"type": "text", "text": full_text})
+    for tc in tool_calls:
+        raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+
+    return Thought(
+        text=full_text or None,
+        tool_calls=tool_calls,
+        raw_content=raw_content,
+        thinking=full_thinking or None
+    ), input_tokens
 
 
 # --- SSE Parsing Tests ---
@@ -160,3 +245,51 @@ def test_build_thought_tool_with_empty_input():
     assert len(thought.tool_calls) == 1
     assert thought.tool_calls[0].name == "list_files"
     assert thought.tool_calls[0].args == {}
+
+
+def test_build_thought_with_thinking():
+    """Verify thinking deltas are accumulated and stored."""
+    events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 50}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Let me"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " reason"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Here's the answer."}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_stop"},
+    ]
+    thought, tokens = build_thought_from_events(events)
+    assert thought.thinking == "Let me reason"
+    assert thought.text == "Here's the answer."
+    assert tokens == 50
+    assert len(thought.raw_content) == 2  # thinking + text
+    assert thought.raw_content[0]["type"] == "thinking"
+
+
+def test_build_thought_thinking_print_fn():
+    """Verify thinking_print_fn is called for each thinking delta."""
+    chunks = []
+    events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "step one"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " step two"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_stop"},
+    ]
+    thought, _ = build_thought_from_events(events, thinking_print_fn=chunks.append)
+    assert chunks == ["step one", " step two"]
+    assert thought.thinking == "step one step two"
+
+
+def test_build_thought_error_event_raises():
+    """Verify SSE error events raise an exception."""
+    import pytest
+    events = [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+        {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+    ]
+    with pytest.raises(Exception, match="Stream error: Overloaded"):
+        build_thought_from_events(events)

@@ -3,7 +3,7 @@ import tempfile
 import pytest
 from nanocode import (
     Agent, AgentStop, Thought, ToolCall, ToolContext, Memory,
-    ReadFile, WriteFile, EditFile, ListFiles, SearchCodebase, SaveMemory, RunCommand,
+    ReadFile, WriteFile, WritePlan, EditFile, ListFiles, SearchCodebase, SaveMemory, RunCommand,
     get_tool, tool_definitions, tools,
 )
 
@@ -67,12 +67,71 @@ def test_mode_command_switches_to_act():
     assert agent.mode == "act"
 
 
-def test_write_file_blocked_in_plan_mode():
-    """Verify WriteFile is blocked in plan mode."""
-    tool = WriteFile()
-    context = ToolContext(mode="plan")
-    result = tool.execute(context, path="test.py", content="hello")
-    assert "BLOCKED" in result
+def test_write_file_writes_file():
+    """Verify WriteFile writes content to the given path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = os.path.join(tmpdir, "test.py")
+        tool = WriteFile()
+        context = ToolContext()
+        result = tool.execute(context, file_path, "print('hello')")
+        assert "Successfully wrote" in result
+        assert os.path.exists(file_path)
+
+
+def test_write_plan_saves_file():
+    """Verify WritePlan writes to PLAN.md."""
+    original_dir = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.chdir(tmpdir)
+        try:
+            tool = WritePlan()
+            context = ToolContext()
+            result = tool.execute(context, content="# My Plan")
+            assert "Plan saved" in result
+            assert os.path.exists("PLAN.md")
+        finally:
+            os.chdir(original_dir)
+
+
+# --- Tool filtering by mode ---
+
+def test_plan_mode_hides_write_tools():
+    """Verify plan mode does not expose write tools to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" not in tool_names
+    assert "edit_file" not in tool_names
+    assert "run_command" not in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+
+
+def test_act_mode_shows_all_tools():
+    """Verify act mode exposes all tools to the brain."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    tool_names = [t["name"] for t in agent.brain.tools]
+
+    assert "write_file" in tool_names
+    assert "edit_file" in tool_names
+    assert "run_command" in tool_names
+    assert "write_plan" in tool_names
+
+
+def test_mode_switch_updates_brain_tools():
+    """Verify switching mode changes the brain's tool menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+    assert "edit_file" not in plan_names
+    assert "run_command" not in plan_names
+
+    agent.handle_input("/mode act")
+    act_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" in act_names
+    assert "edit_file" in act_names
+    assert "run_command" in act_names
 
 
 # --- New tests for Chapter 8: Awareness tools ---
@@ -217,20 +276,10 @@ def test_agent_execute_search_codebase():
 
 # --- New tests for Chapter 9: RunCommand tool ---
 
-def test_run_command_blocked_in_plan_mode():
-    """Verify run_command is blocked in plan mode."""
+def test_run_command_executes():
+    """Verify run_command executes a command."""
     tool = RunCommand()
-    context = ToolContext(mode="plan")
-    result = tool.execute(context, command="echo hello")
-
-    assert "BLOCKED" in result
-    assert "plan mode" in result
-
-
-def test_run_command_allowed_in_act_mode():
-    """Verify run_command works in act mode."""
-    tool = RunCommand()
-    context = ToolContext(mode="act")
+    context = ToolContext()
     result = tool.execute(context, command="echo hello")
 
     assert "STDOUT" in result
@@ -240,7 +289,7 @@ def test_run_command_allowed_in_act_mode():
 def test_run_command_captures_stderr():
     """Verify run_command captures error output."""
     tool = RunCommand()
-    context = ToolContext(mode="act")
+    context = ToolContext()
     result = tool.execute(context, command="python -c \"import sys; sys.stderr.write('error!')\"")
 
     assert "STDERR" in result
@@ -250,7 +299,7 @@ def test_run_command_captures_stderr():
 def test_run_command_handles_nonexistent_command():
     """Verify run_command handles commands that don't exist."""
     tool = RunCommand()
-    context = ToolContext(mode="act")
+    context = ToolContext()
     result = tool.execute(context, command="nonexistent_command_xyz_12345")
 
     # Should have some error output (either STDERR or Error message)
@@ -260,7 +309,7 @@ def test_run_command_handles_nonexistent_command():
 def test_run_command_runs_python():
     """Verify run_command can run Python scripts."""
     tool = RunCommand()
-    context = ToolContext(mode="act")
+    context = ToolContext()
     result = tool.execute(context, command="python -c \"print('hello from python')\"")
 
     assert "hello from python" in result
@@ -273,20 +322,12 @@ def test_agent_has_run_command_tool():
     assert "run_command" in tool_names
 
 
-def test_agent_execute_run_command_in_act_mode():
-    """Verify agent can execute run_command in act mode."""
+def test_agent_execute_run_command():
+    """Verify agent can execute run_command."""
     agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
     result = agent._execute_tool("run_command", {"command": "echo test"})
 
     assert "test" in result
-
-
-def test_agent_execute_run_command_blocked_in_plan_mode():
-    """Verify agent blocks run_command in plan mode."""
-    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
-    result = agent._execute_tool("run_command", {"command": "echo test"})
-
-    assert "BLOCKED" in result
 
 
 def test_tool_definitions_includes_run_command():
@@ -306,7 +347,7 @@ def test_edit_file_replaces_text():
 
     try:
         tool = EditFile()
-        context = ToolContext(mode="act")
+        context = ToolContext()
         result = tool.execute(context, temp_path, "y = 2", "y = 42")
 
         assert "Successfully" in result
@@ -314,25 +355,6 @@ def test_edit_file_replaces_text():
             content = f.read()
         assert "y = 42" in content
         assert "y = 2" not in content
-    finally:
-        os.unlink(temp_path)
-
-
-def test_edit_file_blocked_in_plan_mode():
-    """Verify EditFile is blocked in plan mode."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("x = 1\n")
-        temp_path = f.name
-
-    try:
-        tool = EditFile()
-        context = ToolContext(mode="plan")
-        result = tool.execute(context, temp_path, "x = 1", "x = 99")
-
-        assert "BLOCKED" in result
-        with open(temp_path) as f:
-            content = f.read()
-        assert "x = 1" in content  # Unchanged
     finally:
         os.unlink(temp_path)
 
@@ -345,7 +367,7 @@ def test_edit_file_not_found():
 
     try:
         tool = EditFile()
-        context = ToolContext(mode="act")
+        context = ToolContext()
         result = tool.execute(context, temp_path, "not in file", "replacement")
 
         assert "Error" in result
@@ -375,3 +397,25 @@ def test_compact_conversation_summarizes():
     # After compaction, conversation should be short (summary + current response)
     assert len(agent.conversation) <= 4
     assert "Summary" in str(agent.conversation[0]["content"])
+
+
+def test_compact_conversation_restores_tools_on_error():
+    """Verify compaction restores tools even if summarization fails."""
+    class FailBrain(FakeBrain):
+        def think(self, conversation):
+            if not self.tools:
+                raise RuntimeError("API error during compaction")
+            return super().think(conversation)
+
+    responses = [
+        Thought(text="Response", raw_content=[{"type": "text", "text": "Response"}]),
+    ]
+    brain = FailBrain(responses=responses)
+    brain.tools = tool_definitions(tools)
+    brain.last_input_tokens = 200_000  # Trigger compaction
+    agent = Agent(brain=brain, tools=tools, mode="act")
+
+    agent.handle_input("Do something")
+
+    # Tools should be restored despite the compaction error
+    assert len(brain.tools) > 0

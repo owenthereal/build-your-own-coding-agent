@@ -21,7 +21,10 @@ def request_with_retry(url, headers, payload, max_retries=10):
 
         if response.status_code == 429 or response.status_code >= 500:
             retry_after = response.headers.get("retry-after")
-            wait_time = int(retry_after) if retry_after else 2 ** attempt
+            try:
+                wait_time = int(retry_after) if retry_after else 2 ** attempt
+            except (ValueError, TypeError):
+                wait_time = 2 ** attempt
             print(f"Error {response.status_code}. Retrying in {wait_time}s...")
             time.sleep(wait_time)
             continue
@@ -59,9 +62,10 @@ class ToolCall:
 class Thought:
     """Standardized response from any Brain."""
 
-    def __init__(self, text=None, tool_calls=None):
+    def __init__(self, text=None, tool_calls=None, thinking=None):
         self.text = text  # str or None
         self.tool_calls = tool_calls or []  # list of ToolCall
+        self.thinking = thinking  # str or None
 
 
 # --- Brain Interface ---
@@ -72,6 +76,30 @@ class Brain:
     def think(self, conversation):
         """Process conversation, return Thought."""
         raise NotImplementedError
+
+    def _parse_response(self, content):
+        """Convert API response format to Thought."""
+        text_parts = []
+        tool_calls = []
+        thinking = None
+
+        for block in content:
+            if block["type"] == "thinking":
+                thinking = block["thinking"]
+            elif block["type"] == "text":
+                text_parts.append(block["text"])
+            elif block["type"] == "tool_use":
+                tool_calls.append(ToolCall(
+                    id=block["id"],
+                    name=block["name"],
+                    args=block["input"]
+                ))
+
+        return Thought(
+            text="\n".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            thinking=thinking
+        )
 
 
 class Claude(Brain):
@@ -92,33 +120,16 @@ class Claude(Brain):
         }
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 10000
+            },
             "messages": conversation
         }
 
-        print("(Claude is thinking...)")
         response = request_with_retry(self.url, headers, payload)
         return self._parse_response(response.json()["content"])
-
-    def _parse_response(self, content):
-        """Convert Claude's response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls
-        )
 
 
 class DeepSeek(Brain):
@@ -143,29 +154,8 @@ class DeepSeek(Brain):
             "messages": conversation
         }
 
-        print("(DeepSeek is thinking...)")
         response = request_with_retry(self.url, headers, payload)
         return self._parse_response(response.json()["content"])
-
-    def _parse_response(self, content):
-        """Convert Anthropic response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls
-        )
 
 
 # Available brains
@@ -200,6 +190,11 @@ class Agent:
 
         try:
             thought = self.brain.think(self.conversation)
+            if thought.thinking:
+                lines = thought.thinking.strip().split("\n")[:5]
+                for i, line in enumerate(lines):
+                    prefix = "  💭 " if i == 0 else "     "
+                    print(f"\033[2m{prefix}{line}\033[0m")
             text = thought.text or ""
             self.conversation.append({"role": "assistant", "content": text})
             return text

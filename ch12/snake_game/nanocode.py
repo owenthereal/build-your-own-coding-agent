@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import time
 import requests
 from dotenv import load_dotenv
@@ -30,13 +31,7 @@ def request_with_retry(url, headers, payload, max_retries=10):
             time.sleep(wait_time)
             continue
 
-        if response.status_code >= 400:
-            try:
-                error_msg = response.json()["error"]["message"]
-            except (KeyError, ValueError):
-                error_msg = response.text
-            raise Exception(f"API error ({response.status_code}): {error_msg}")
-
+        response.raise_for_status()
         return response
 
     raise Exception(f"Request failed after {max_retries} retries")
@@ -212,10 +207,40 @@ class DeepSeek(Brain):
         return self._parse_response(response.json()["content"])
 
 
+class Ollama(Brain):
+    """Ollama local model (Anthropic-compatible API, with tool support)."""
+
+    def __init__(self, memory=None, tools=None):
+        self.memory = memory
+        self.tools = tools or []
+        self.model = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
+        self.url = "http://localhost:11434/v1/messages"
+
+    def think(self, conversation):
+        headers = {
+            "x-api-key": "ollama",  # Required but not validated
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": conversation
+        }
+        if self.memory:
+            payload["system"] = self.memory.content
+        if self.tools:
+            payload["tools"] = self.tools
+
+        response = request_with_retry(self.url, headers, payload)
+        return self._parse_response(response.json()["content"])
+
+
 # Available brains
 BRAINS = {
     "claude": Claude,
     "deepseek": DeepSeek,
+    "ollama": Ollama,
 }
 
 
@@ -290,6 +315,36 @@ class WritePlan:
             return "Plan saved to PLAN.md"
         except Exception as e:
             return f"Error saving plan: {e}"
+
+
+class EditFile:
+    """Replaces text in a file (surgical edit)."""
+    name = "edit_file"
+    plan_safe = False
+    description = "Replaces specific text in a file. Use for surgical edits instead of rewriting entire files."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "old_text": {"type": "string", "description": "Exact text to find and replace"},
+            "new_text": {"type": "string", "description": "Text to replace it with"}
+        },
+        "required": ["path", "old_text", "new_text"]
+    }
+
+    def execute(self, context, path, old_text, new_text):
+        print(f"  → Editing {path}")
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if old_text not in content:
+                return f"Error: Could not find the specified text in {path}"
+            new_content = content.replace(old_text, new_text, 1)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            return f"Successfully edited {path}"
+        except Exception as e:
+            return f"Error editing file: {e}"
 
 
 class ListFiles:
@@ -380,6 +435,77 @@ class SaveMemory:
         return "Memory updated successfully."
 
 
+class RunCommand:
+    """Executes shell commands."""
+    name = "run_command"
+    plan_safe = False
+    description = "Executes a terminal command. Use this to run scripts, tests, or install packages."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "The shell command to run (e.g., 'python test.py')"}
+        },
+        "required": ["command"]
+    }
+
+    def execute(self, context, command):
+        print(f"  → Running: {command[:50]}...")
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=os.getcwd()
+            )
+
+            output = ""
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n"
+            if not output:
+                output = "(No output)"
+
+            return output.strip()
+
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds."
+        except Exception as e:
+            return f"Error executing command: {e}"
+
+
+class SearchWeb:
+    """Searches the internet using DuckDuckGo."""
+    name = "search_web"
+    plan_safe = True
+    description = "Searches the internet for current information. Use when you need knowledge beyond your training data."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"}
+        },
+        "required": ["query"]
+    }
+
+    def execute(self, context, query):
+        print(f"  → Searching web for '{query}'")
+        try:
+            from ddgs import DDGS
+            results = DDGS().text(query, max_results=3)
+            if not results:
+                return "No results found."
+
+            formatted = []
+            for r in results:
+                formatted.append(f"Title: {r['title']}\nURL: {r['href']}\nSummary: {r['body']}\n")
+
+            return "\n".join(formatted)
+        except Exception as e:
+            return f"Error searching web: {e}"
+
+
 # --- Tool Helpers ---
 
 def get_tool(tools, name):
@@ -397,7 +523,8 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), SearchWeb(),
+         WriteFile(), EditFile(), RunCommand()]
 
 
 # --- Agent Class ---
@@ -458,8 +585,9 @@ class Agent:
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
         output_parts = []
+        max_iterations = 50
 
-        while True:
+        for _iteration in range(max_iterations):
             thought = self.brain.think(self.conversation)
 
             # Display thinking
@@ -491,6 +619,8 @@ class Agent:
                 })
 
             self.conversation.append({"role": "user", "content": tool_results})
+        else:
+            output_parts.append("(Stopped: too many iterations)")
 
         return "\n".join(output_parts)
 
@@ -530,7 +660,7 @@ def main():
     brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
     agent = Agent(brain=brain, tools=tools, memory=memory, mode=mode, brain_name=brain_name)
 
-    print(f"⚡ Nanocode v0.7")
+    print(f"⚡ Nanocode v1.0")
     print(f"Commands: /q quit, /switch toggle brain, /mode [plan|act]")
     print(f"Brain: {brain_name}")
     if mode == "act":

@@ -26,9 +26,10 @@ class ToolCall:
 class Thought:
     """Standardized response from any Brain."""
 
-    def __init__(self, text=None, tool_calls=None):
+    def __init__(self, text=None, tool_calls=None, thinking=None):
         self.text = text  # str or None
         self.tool_calls = tool_calls or []  # list of ToolCall
+        self.thinking = thinking  # str or None
 
 
 # --- Claude (The Brain) ---
@@ -51,11 +52,14 @@ class Claude:
         }
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 10000
+            },
             "messages": conversation
         }
 
-        print("(Claude is thinking...)")
         response = requests.post(self.url, headers=headers, json=payload, timeout=120)
         response.raise_for_status()
         return self._parse_response(response.json()["content"])
@@ -64,9 +68,12 @@ class Claude:
         """Convert Claude's response format to Thought."""
         text_parts = []
         tool_calls = []
+        thinking = None
 
         for block in content:
-            if block["type"] == "text":
+            if block["type"] == "thinking":
+                thinking = block["thinking"]
+            elif block["type"] == "text":
                 text_parts.append(block["text"])
             elif block["type"] == "tool_use":
                 tool_calls.append(ToolCall(
@@ -77,7 +84,8 @@ class Claude:
 
         return Thought(
             text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls
+            tool_calls=tool_calls,
+            thinking=thinking
         )
 
 
@@ -102,6 +110,11 @@ class Agent:
 
         try:
             thought = self.brain.think(self.conversation)
+            if thought.thinking:
+                lines = thought.thinking.strip().split("\n")[:5]
+                for i, line in enumerate(lines):
+                    prefix = "  💭 " if i == 0 else "     "
+                    print(f"\033[2m{prefix}{line}\033[0m")
             text = thought.text or ""
             self.conversation.append({"role": "assistant", "content": text})
             return text

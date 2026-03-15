@@ -13,37 +13,6 @@ except ImportError:
 load_dotenv()
 
 
-# --- HTTP Helpers ---
-
-def request_with_retry(url, headers, payload, max_retries=10):
-    """Make HTTP POST with retry on rate limit (429), server errors (5xx), and network failures."""
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
-        except requests.exceptions.RequestException as e:
-            wait_time = 2 ** attempt
-            print(f"Network error: {e}. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-            continue
-
-        if response.status_code == 429 or response.status_code >= 500:
-            retry_after = response.headers.get("retry-after")
-            wait_time = int(retry_after) if retry_after else 2 ** attempt
-            print(f"Error {response.status_code}. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-            continue
-
-        if response.status_code >= 400:
-            try:
-                error_msg = response.json()["error"]["message"]
-            except (KeyError, ValueError):
-                error_msg = response.text
-            raise Exception(f"API error ({response.status_code}): {error_msg}")
-
-        return response
-
-    raise Exception(f"Request failed after {max_retries} retries")
-
 
 # --- Exceptions ---
 
@@ -66,10 +35,11 @@ class ToolCall:
 class Thought:
     """Standardized response from any Brain."""
 
-    def __init__(self, text=None, tool_calls=None, raw_content=None):
+    def __init__(self, text=None, tool_calls=None, raw_content=None, thinking=None):
         self.text = text  # str or None
         self.tool_calls = tool_calls or []  # list of ToolCall
         self.raw_content = raw_content  # original API response for message history
+        self.thinking = thinking  # str or None
 
 
 # --- Memory Class ---
@@ -107,8 +77,7 @@ class Memory:
 class ToolContext:
     """What tools need to know about the agent's state."""
 
-    def __init__(self, mode=None, memory=None):
-        self.mode = mode      # "plan" or "act"
+    def __init__(self, memory=None):
         self.memory = memory  # Memory object or None
 
 
@@ -123,75 +92,149 @@ class Brain:
         """Process conversation, return Thought."""
         raise NotImplementedError
 
+    def _stream_response(self, url, headers, payload, max_retries=10):
+        """Stream an API response, printing tokens as they arrive."""
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=payload,
+                                         stream=True, timeout=120)
+            except requests.exceptions.RequestException as e:
+                wait_time = 2 ** attempt
+                print(f"Network error: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
 
-# --- Streaming Helpers ---
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_after = response.headers.get("retry-after")
+                try:
+                    wait_time = int(retry_after) if retry_after else 2 ** attempt
+                except (ValueError, TypeError):
+                    wait_time = 2 ** attempt
+                print(f"Error {response.status_code}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
 
-def parse_sse_events(raw_lines):
-    """Parse raw SSE lines into a list of event dicts."""
-    events = []
-    for line in raw_lines:
-        if isinstance(line, bytes):
+            if response.status_code >= 400:
+                try:
+                    error_msg = response.json()["error"]["message"]
+                except (KeyError, ValueError):
+                    error_msg = response.text
+                raise Exception(f"API error ({response.status_code}): {error_msg}")
+
+            break
+        else:
+            raise Exception(f"Request failed after {max_retries} retries")
+
+        blocks = {}  # Per-block state by index
+        block_parts = {}  # Per-block text accumulator
+        tool_calls = []
+        current_tool = None
+        current_index = 0
+        input_tokens = 0
+        has_text = False
+
+        for line in response.iter_lines():
+            if not line:
+                continue
             line = line.decode("utf-8")
-        if not line.startswith("data: "):
-            continue
-        try:
-            events.append(json.loads(line[6:]))
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return events
+            if not line.startswith("data: "):
+                continue
 
+            try:
+                data = json.loads(line[6:])
+            except (json.JSONDecodeError, ValueError):
+                continue  # Skip non-JSON lines (e.g., "data: [DONE]")
+            event_type = data.get("type")
 
-def build_thought_from_events(events, print_fn=None):
-    """Build a Thought from parsed SSE events. Returns (Thought, input_tokens)."""
-    text_parts = []
-    raw_content = []
-    tool_calls = []
-    current_tool = None
-    input_tokens = 0
+            if event_type == "message_start":
+                input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
 
-    for data in events:
-        event_type = data.get("type")
+            elif event_type == "error":
+                error = data.get("error", {})
+                raise Exception(f"Stream error: {error.get('message', data)}")
 
-        if event_type == "message_start":
-            input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+            elif event_type == "content_block_start":
+                block = data.get("content_block", {})
+                current_index = data.get("index", 0)
+                blocks[current_index] = {"type": block.get("type")}
+                block_parts[current_index] = []
+                if block.get("type") == "tool_use":
+                    current_tool = {"id": block["id"], "name": block["name"], "input": ""}
+                elif block.get("type") == "thinking":
+                    print("\033[2m  💭 ", end="", flush=True)
 
-        elif event_type == "content_block_start":
-            block = data.get("content_block", {})
-            if block.get("type") == "tool_use":
-                current_tool = {"id": block["id"], "name": block["name"], "input": ""}
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    text = delta["thinking"]
+                    print(text, end="", flush=True)
+                    block_parts[current_index].append(text)
+                elif delta.get("type") == "text_delta":
+                    text = delta["text"]
+                    print(text, end="", flush=True)
+                    block_parts[current_index].append(text)
+                    has_text = True
+                elif delta.get("type") == "signature_delta":
+                    blocks[current_index]["signature"] = blocks[current_index].get("signature", "") + delta.get("signature", "")
+                elif delta.get("type") == "input_json_delta":
+                    if current_tool:
+                        current_tool["input"] += delta.get("partial_json", "")
 
-        elif event_type == "content_block_delta":
-            delta = data.get("delta", {})
-            if delta.get("type") == "text_delta":
-                text = delta["text"]
-                if print_fn:
-                    print_fn(text)
-                text_parts.append(text)
-            elif delta.get("type") == "input_json_delta":
-                if current_tool:
-                    current_tool["input"] += delta.get("partial_json", "")
+            elif event_type == "content_block_stop":
+                idx = data.get("index", current_index)
+                block_type = blocks.get(idx, {}).get("type")
+                block_text = "".join(block_parts.get(idx, []))
+                if block_type == "thinking":
+                    print("\033[0m")  # Reset dim, newline
+                    blocks[idx]["content"] = block_text
+                elif block_type == "text":
+                    blocks[idx]["content"] = block_text
+                elif block_type == "tool_use" and current_tool:
+                    tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
+                    tc = ToolCall(
+                        id=current_tool["id"],
+                        name=current_tool["name"],
+                        args=tool_input
+                    )
+                    tool_calls.append(tc)
+                    blocks[idx]["tool_call"] = tc
+                    current_tool = None
 
-        elif event_type == "content_block_stop":
-            if current_tool:
-                tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
-                tool_calls.append(ToolCall(
-                    id=current_tool["id"],
-                    name=current_tool["name"],
-                    args=tool_input
-                ))
-                current_tool = None
+            elif event_type == "message_stop":
+                if has_text:
+                    print()  # Newline after streamed text
 
-    full_text = "".join(text_parts)
-    if full_text:
-        raw_content.append({"type": "text", "text": full_text})
-    for tc in tool_calls:
-        raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+        self.last_input_tokens = input_tokens
 
-    return Thought(
-        text=full_text or None,
-        tool_calls=tool_calls,
-        raw_content=raw_content
-    ), input_tokens
+        # Build raw_content in index order (matches API's content array)
+        raw_content = []
+        all_text = []
+        all_thinking = []
+        for idx in sorted(blocks.keys()):
+            block = blocks[idx]
+            content = block.get("content", "")
+            if block["type"] == "thinking" and content:
+                entry = {"type": "thinking", "thinking": content}
+                if "signature" in block:
+                    entry["signature"] = block["signature"]
+                raw_content.append(entry)
+                all_thinking.append(content)
+            elif block["type"] == "text" and content:
+                raw_content.append({"type": "text", "text": content})
+                all_text.append(content)
+            elif block["type"] == "tool_use" and "tool_call" in block:
+                tc = block["tool_call"]
+                raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+
+        full_text = "\n".join(all_text) if all_text else None
+        full_thinking = "\n".join(all_thinking) if all_thinking else None
+
+        return Thought(
+            text=full_text,
+            tool_calls=tool_calls,
+            raw_content=raw_content,
+            thinking=full_thinking
+        )
 
 
 class Claude(Brain):
@@ -214,30 +257,11 @@ class Claude(Brain):
         }
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
-            "messages": conversation
-        }
-        if self.memory:
-            payload["system"] = self.memory.content
-        if self.tools:
-            payload["tools"] = self.tools
-
-        print("(Claude is thinking...)")
-        response = request_with_retry(self.url, headers, payload)
-        data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
-        return self._parse_response(data["content"])
-
-    def think_streaming(self, conversation):
-        """Streaming version of think() — prints tokens as they arrive."""
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        payload = {
-            "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 10000
+            },
             "messages": conversation,
             "stream": True,
         }
@@ -246,87 +270,7 @@ class Claude(Brain):
         if self.tools:
             payload["tools"] = self.tools
 
-        response = requests.post(self.url, headers=headers, json=payload, stream=True)
-        response.raise_for_status()
-
-        text_parts = []
-        raw_content = []
-        tool_calls = []
-        current_tool = None
-        input_tokens = 0
-
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if not line.startswith("data: "):
-                continue
-
-            data = json.loads(line[6:])
-            event_type = data.get("type")
-
-            if event_type == "message_start":
-                input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
-
-            elif event_type == "content_block_start":
-                block = data.get("content_block", {})
-                if block.get("type") == "tool_use":
-                    current_tool = {"id": block["id"], "name": block["name"], "input": ""}
-
-            elif event_type == "content_block_delta":
-                delta = data.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    text = delta["text"]
-                    print(text, end="", flush=True)  # Stream to terminal
-                    text_parts.append(text)
-                elif delta.get("type") == "input_json_delta":
-                    if current_tool:
-                        current_tool["input"] += delta.get("partial_json", "")
-
-            elif event_type == "content_block_stop":
-                if current_tool:
-                    tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
-                    tool_calls.append(ToolCall(
-                        id=current_tool["id"],
-                        name=current_tool["name"],
-                        args=tool_input
-                    ))
-                    current_tool = None
-
-            elif event_type == "message_stop":
-                if text_parts:
-                    print()  # Newline after streamed text
-
-        self.last_input_tokens = input_tokens
-
-        full_text = "".join(text_parts)
-        if full_text:
-            raw_content.append({"type": "text", "text": full_text})
-        for tc in tool_calls:
-            raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
-
-        return Thought(text=full_text or None, tool_calls=tool_calls or None, raw_content=raw_content)
-
-    def _parse_response(self, content):
-        """Convert Claude's response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            raw_content=content
-        )
+        return self._stream_response(self.url, headers, payload)
 
 
 class DeepSeek(Brain):
@@ -351,39 +295,15 @@ class DeepSeek(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
-            "messages": conversation
+            "messages": conversation,
+            "stream": True,
         }
         if self.memory:
             payload["system"] = self.memory.content
         if self.tools:
             payload["tools"] = self.tools
 
-        print("(DeepSeek is thinking...)")
-        response = request_with_retry(self.url, headers, payload)
-        data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
-        return self._parse_response(data["content"])
-
-    def _parse_response(self, content):
-        """Convert Anthropic response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            raw_content=content
-        )
+        return self._stream_response(self.url, headers, payload)
 
 
 class Ollama(Brain):
@@ -422,39 +342,15 @@ class Ollama(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
-            "messages": conversation
+            "messages": conversation,
+            "stream": True,
         }
         if self.memory:
             payload["system"] = self.memory.content
         if self.tools:
             payload["tools"] = self.tools
 
-        print(f"({self.model} is thinking...)")
-        response = request_with_retry(self.url, headers, payload)
-        data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
-        return self._parse_response(data["content"])
-
-    def _parse_response(self, content):
-        """Convert Anthropic response format to Thought."""
-        text_parts = []
-        tool_calls = []
-
-        for block in content:
-            if block["type"] == "text":
-                text_parts.append(block["text"])
-            elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    id=block["id"],
-                    name=block["name"],
-                    args=block["input"]
-                ))
-
-        return Thought(
-            text="\n".join(text_parts) if text_parts else None,
-            tool_calls=tool_calls,
-            raw_content=content
-        )
+        return self._stream_response(self.url, headers, payload)
 
 
 # Available brains
@@ -470,11 +366,12 @@ BRAINS = {
 class ReadFile:
     """Reads a file from the filesystem."""
     name = "read_file"
+    plan_safe = True
     description = "Reads a file from the filesystem. Use this to examine code."
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "The relative path to the file"}
+            "path": {"type": "string", "description": "The path to the file"}
         },
         "required": ["path"]
     }
@@ -495,34 +392,20 @@ class ReadFile:
 
 
 class WriteFile:
-    """Writes content to a file (mode-aware)."""
+    """Writes content to a file."""
     name = "write_file"
-    description = "Writes content to a file. In plan mode, only PLAN.md is allowed."
+    plan_safe = False
+    description = "Writes content to a file."
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "The relative path to the file"},
+            "path": {"type": "string", "description": "The path to the file"},
             "content": {"type": "string", "description": "The full content to write"}
         },
         "required": ["path", "content"]
     }
 
     def execute(self, context, path, content):
-        # Always allow writing to PLAN.md
-        if os.path.basename(path) == "PLAN.md":
-            print(f"  → Writing {path}")
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                return "Plan saved successfully to PLAN.md"
-            except Exception as e:
-                return f"Error saving plan: {e}"
-
-        # Block in plan mode
-        if context.mode == "plan":
-            return f"BLOCKED: Cannot write to '{path}' in plan mode. Write to 'PLAN.md' instead."
-
-        # Allow in act mode
         print(f"  → Writing {path}")
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -532,9 +415,33 @@ class WriteFile:
             return f"Error writing file: {e}"
 
 
+class WritePlan:
+    """Saves a plan to PLAN.md."""
+    name = "write_plan"
+    plan_safe = True
+    description = "Saves a plan to PLAN.md. Use this to outline your approach before making changes."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The plan content in markdown"}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print("  → Writing PLAN.md")
+        try:
+            with open("PLAN.md", 'w', encoding='utf-8') as f:
+                f.write(content)
+            return "Plan saved to PLAN.md"
+        except Exception as e:
+            return f"Error saving plan: {e}"
+
+
 class EditFile:
     """Replaces text in a file (surgical edit)."""
     name = "edit_file"
+    plan_safe = False
     description = "Replaces specific text in a file. Use for surgical edits instead of rewriting entire files."
     input_schema = {
         "type": "object",
@@ -548,9 +455,6 @@ class EditFile:
 
     def execute(self, context, path, old_text, new_text):
         print(f"  → Editing {path}")
-        if context.mode == "plan":
-            return "BLOCKED: Cannot edit files in plan mode."
-
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -567,6 +471,7 @@ class EditFile:
 class ListFiles:
     """Lists files in the project structure."""
     name = "list_files"
+    plan_safe = True
     description = "Lists all files in the project structure. Useful to understand the project layout."
     input_schema = {
         "type": "object",
@@ -580,8 +485,7 @@ class ListFiles:
         try:
             file_list = []
             for root, dirs, files in os.walk(path):
-                if any(p in root for p in [".git", "__pycache__", "venv", ".nanocode"]):
-                    continue
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
 
                 level = root.replace(path, '').count(os.sep)
                 indent = ' ' * 4 * (level)
@@ -598,6 +502,7 @@ class ListFiles:
 class SearchCodebase:
     """Searches for a string in all files."""
     name = "search_codebase"
+    plan_safe = True
     description = "Searches the entire codebase for a text string. Useful to find where functions or variables are defined."
     input_schema = {
         "type": "object",
@@ -613,8 +518,7 @@ class SearchCodebase:
         results = []
         try:
             for root, dirs, files in os.walk(path):
-                if any(p in root for p in [".git", "__pycache__", "venv", ".nanocode"]):
-                    continue
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
 
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -634,6 +538,7 @@ class SearchCodebase:
 class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
+    plan_safe = True
     description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
     input_schema = {
         "type": "object",
@@ -652,9 +557,10 @@ class SaveMemory:
 
 
 class RunCommand:
-    """Executes shell commands (mode-aware)."""
+    """Executes shell commands."""
     name = "run_command"
-    description = "Executes a terminal command. Use this to run scripts, tests, or install packages. Blocked in plan mode."
+    plan_safe = False
+    description = "Executes a terminal command. Use this to run scripts, tests, or install packages."
     input_schema = {
         "type": "object",
         "properties": {
@@ -665,10 +571,6 @@ class RunCommand:
 
     def execute(self, context, command):
         print(f"  → Running: {command[:50]}...")
-        # Block in plan mode - running commands can modify state
-        if context.mode == "plan":
-            return "BLOCKED: Cannot run commands in plan mode. Switch to act mode first."
-
         try:
             result = subprocess.run(
                 command,
@@ -698,6 +600,7 @@ class RunCommand:
 class SearchWeb:
     """Searches the internet using DuckDuckGo."""
     name = "search_web"
+    plan_safe = True
     description = "Searches the internet for current information. Use when you need knowledge beyond your training data."
     input_schema = {
         "type": "object",
@@ -742,16 +645,8 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [
-    ReadFile(),
-    WriteFile(),
-    EditFile(),
-    ListFiles(),
-    SearchCodebase(),
-    SaveMemory(),
-    RunCommand(),
-    SearchWeb(),
-]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), SearchWeb(),
+         WriteFile(), EditFile(), RunCommand()]
 
 
 # --- Agent Class ---
@@ -766,6 +661,13 @@ class Agent:
         self.mode = mode  # "plan" or "act"
         self.brain_name = brain_name
         self.conversation = []
+        self.brain.tools = self._tools_for_mode()
+
+    def _tools_for_mode(self):
+        """Return tool definitions based on current mode."""
+        if self.mode == "act":
+            return tool_definitions(self.tools)
+        return tool_definitions([t for t in self.tools if t.plan_safe])
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
@@ -795,10 +697,12 @@ class Agent:
         parts = user_input.strip().split()
         if len(parts) > 1 and parts[1] == "act":
             self.mode = "act"
+            self.brain.tools = self._tools_for_mode()
             return "⚠️  Switched to ACT MODE (Writing Enabled)"
         else:
             self.mode = "plan"
-            return "🛡️  Switched to PLAN MODE (Read-Only)"
+            self.brain.tools = self._tools_for_mode()
+            return "🛡️  Switched to PLAN MODE (Code Read-Only)"
 
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
@@ -835,9 +739,9 @@ class Agent:
 
             self.conversation.append({"role": "user", "content": tool_results})
         else:
-            output_parts.append("(Stopped: too many iterations)")
+            print("(Stopped: too many iterations)")
 
-        return "\n".join(output_parts)
+        return ""  # Text was already streamed to terminal
 
     def _compact_conversation(self):
         """Summarize old messages to stay within context limits."""
@@ -852,7 +756,12 @@ class Agent:
                        f"Focus on what was accomplished, what's in progress, "
                        f"and key decisions:\n\n{history}"
         }]
-        thought = self.brain.think(prompt)
+        saved_tools = self.brain.tools
+        self.brain.tools = []
+        try:
+            thought = self.brain.think(prompt)
+        finally:
+            self.brain.tools = saved_tools
         self.conversation = [
             {"role": "user", "content": f"Previous conversation summary: {thought.text}"},
         ]
@@ -863,7 +772,7 @@ class Agent:
         if tool is None:
             return f"Error: Tool '{name}' not found"
         try:
-            context = ToolContext(mode=self.mode, memory=self.memory)
+            context = ToolContext(memory=self.memory)
             return tool.execute(context, **args)
         except TypeError as e:
             return f"Error: Invalid arguments - {e}"
@@ -875,7 +784,7 @@ class Agent:
         new_name = names[(idx + 1) % len(names)]
 
         try:
-            self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
+            self.brain = BRAINS[new_name](memory=self.memory, tools=self._tools_for_mode())
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
@@ -899,7 +808,7 @@ def main():
     if mode == "act":
         print("Mode: ACT (Writing Enabled)")
     else:
-        print("Mode: PLAN (Read-Only)")
+        print("Mode: PLAN (Code Read-Only)")
 
     while True:
         try:

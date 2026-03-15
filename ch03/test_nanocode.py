@@ -115,6 +115,14 @@ def test_thought_with_text():
     thought = Thought(text="Hello")
     assert thought.text == "Hello"
     assert thought.tool_calls == []
+    assert thought.thinking is None
+
+
+def test_thought_with_thinking():
+    """Verify Thought stores thinking."""
+    thought = Thought(text="Hello", thinking="Let me consider this...")
+    assert thought.thinking == "Let me consider this..."
+    assert thought.text == "Hello"
 
 
 def test_thought_with_tool_calls():

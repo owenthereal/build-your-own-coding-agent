@@ -5,7 +5,7 @@ import tempfile
 
 from nanocode import (
     Agent, AgentStop, Thought, ToolCall, Memory, ToolContext,
-    ReadFile, WriteFile, ListFiles, SearchCodebase, SaveMemory, RunCommand, SearchWeb,
+    ReadFile, WriteFile, WritePlan, ListFiles, SearchCodebase, SaveMemory, RunCommand, SearchWeb,
     BRAINS, tools, get_tool, tool_definitions
 )
 
@@ -71,7 +71,7 @@ def test_search_web_execute_success(monkeypatch):
     ]
     monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: fake_results})())
     tool = SearchWeb()
-    context = ToolContext(mode="plan")
+    context = ToolContext()
     result = tool.execute(context, "latest python version")
     assert "Python 3.13" in result
     assert "https://python.org" in result
@@ -81,7 +81,7 @@ def test_search_web_execute_no_results(monkeypatch):
     """Verify SearchWeb.execute() handles empty results."""
     monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: []})())
     tool = SearchWeb()
-    context = ToolContext(mode="plan")
+    context = ToolContext()
     result = tool.execute(context, "impossible query xyz")
     assert "No results found" in result
 
@@ -92,7 +92,7 @@ def test_search_web_execute_error(monkeypatch):
         raise RuntimeError("Network down")
     monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: raise_error()})())
     tool = SearchWeb()
-    context = ToolContext(mode="plan")
+    context = ToolContext()
     result = tool.execute(context, "test query")
     assert "Error" in result
 
@@ -140,7 +140,7 @@ def test_read_file_adds_line_numbers():
 
     try:
         tool = ReadFile()
-        context = ToolContext(mode="act")
+        context = ToolContext()
         result = tool.execute(context, temp_path)
         assert "1 | line one" in result
         assert "2 | line two" in result
@@ -154,7 +154,7 @@ def test_write_file_creates_file():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "test.txt")
         tool = WriteFile()
-        context = ToolContext(mode="act")
+        context = ToolContext()
         result = tool.execute(context, path, "hello world")
 
         assert os.path.exists(path)
@@ -163,30 +163,65 @@ def test_write_file_creates_file():
             assert f.read() == "hello world"
 
 
-def test_plan_mode_blocks_writes():
-    """Verify plan mode blocks write operations."""
+def test_plan_mode_hides_write_tools():
+    """Verify plan mode removes write tools from brain's menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in tool_names
+    assert "edit_file" not in tool_names
+    assert "run_command" not in tool_names
+    assert "write_plan" in tool_names
+    assert "read_file" in tool_names
+    assert "search_web" in tool_names
+
+
+def test_act_mode_shows_all_tools():
+    """Verify act mode includes all tools in brain's menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+    tool_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" in tool_names
+    assert "edit_file" in tool_names
+    assert "run_command" in tool_names
+
+
+def test_mode_switch_updates_brain_tools():
+    """Verify switching mode updates the brain's tool menu."""
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    plan_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" not in plan_names
+    agent.handle_input("/mode act")
+    act_names = [t["name"] for t in agent.brain.tools]
+    assert "write_file" in act_names
+
+
+def test_write_plan_saves_file():
+    """Verify WritePlan creates PLAN.md with content."""
+    original_dir = os.getcwd()
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "blocked.txt")
+        os.chdir(tmpdir)
+        try:
+            tool = WritePlan()
+            context = ToolContext()
+            result = tool.execute(context, content="# My Plan")
+            assert "Plan saved" in result
+        finally:
+            os.chdir(original_dir)
+
+
+def test_write_file_writes_file():
+    """Verify WriteFile creates a file with content."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = os.path.join(tmpdir, "test.py")
         tool = WriteFile()
-        context = ToolContext(mode="plan")
-        result = tool.execute(context, path, "should be blocked")
-
-        assert "BLOCKED" in result
-        assert not os.path.exists(path)
+        context = ToolContext()
+        result = tool.execute(context, file_path, "print('hello')")
+        assert "Successfully wrote" in result
 
 
-def test_run_command_blocked_in_plan_mode():
-    """Verify RunCommand is blocked in plan mode."""
+def test_run_command_executes():
+    """Verify RunCommand works."""
     tool = RunCommand()
-    context = ToolContext(mode="plan")
-    result = tool.execute(context, "echo hello")
-    assert "BLOCKED" in result
-
-
-def test_run_command_allowed_in_act_mode():
-    """Verify RunCommand works in act mode."""
-    tool = RunCommand()
-    context = ToolContext(mode="act")
+    context = ToolContext()
     result = tool.execute(context, "echo hello")
     assert "hello" in result
 

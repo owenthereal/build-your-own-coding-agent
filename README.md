@@ -35,6 +35,7 @@ Each `chXX/` folder contains a complete, runnable snapshot of the code at the en
 | `ch10/` | Local models — Ollama integration |
 | `ch11/` | Web search — DuckDuckGo tool |
 | `ch12/` | Capstone — build a Snake game with AI |
+| `appendix/` | Streaming — real-time output with extended thinking |
 
 ## Quick Start
 
