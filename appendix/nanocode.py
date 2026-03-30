@@ -85,7 +85,7 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
-    context_limit = 200_000  # Overridden per-instance in subclasses
+    context_limit = 200_000  # Subclasses override as needed
     last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
@@ -243,6 +243,7 @@ class Claude(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
@@ -265,8 +266,8 @@ class Claude(Brain):
             "messages": conversation,
             "stream": True,
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
@@ -280,6 +281,7 @@ class DeepSeek(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
@@ -298,8 +300,8 @@ class DeepSeek(Brain):
             "messages": conversation,
             "stream": True,
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
@@ -313,6 +315,7 @@ class Ollama(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.model = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
         self.url = "http://localhost:11434/v1/messages"
         self._detect_context_limit()
@@ -345,8 +348,8 @@ class Ollama(Brain):
             "messages": conversation,
             "stream": True,
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
@@ -662,6 +665,17 @@ class Agent:
         self.brain_name = brain_name
         self.conversation = []
         self.brain.tools = self._tools_for_mode()
+        self.brain.system = self._build_system_prompt()
+
+    def _build_system_prompt(self):
+        """Build system prompt from memory and current mode."""
+        parts = [self.memory.content] if self.memory else []
+        if self.mode == "plan":
+            parts.append(
+                "You are in PLAN mode. You cannot write code files. "
+                "Use write_plan to save your plans to PLAN.md."
+            )
+        return "\n".join(parts)
 
     def _tools_for_mode(self):
         """Return tool definitions based on current mode."""
@@ -698,10 +712,12 @@ class Agent:
         if len(parts) > 1 and parts[1] == "act":
             self.mode = "act"
             self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
             return "⚠️  Switched to ACT MODE (Writing Enabled)"
         else:
             self.mode = "plan"
             self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
             return "🛡️  Switched to PLAN MODE (Code Read-Only)"
 
     def _agentic_loop(self):
@@ -785,6 +801,7 @@ class Agent:
 
         try:
             self.brain = BRAINS[new_name](memory=self.memory, tools=self._tools_for_mode())
+            self.brain.system = self._build_system_prompt()
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
